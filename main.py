@@ -1,14 +1,20 @@
+import os
+import gc
+import logging
+import tempfile
+import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from paddleocr import PaddleOCR
 from PIL import Image, ImageEnhance
-import uvicorn
-import tempfile
-import os
-import logging
 
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Optimization: Limit PaddlePaddle internal memory pre-allocation
+os.environ['FLAGS_allocator_strategy'] = 'naive_best_fit'
+os.environ['FLAGS_fraction_of_gpu_memory_to_use'] = '0' # Ensure no GPU attempt
 
 app = FastAPI(title="EF Analyzer OCR Backend")
 
@@ -19,189 +25,150 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize once on startup
+# Global OCR Instance - Optimized for low-RAM environments (Railway/HF)
 ocr = PaddleOCR(
     use_angle_cls=True,
     lang='en',
     use_gpu=False,
     show_log=False,
     ocr_version='PP-OCRv4',
-    det_db_thresh=0.3,
-    det_db_box_thresh=0.5,
-    det_db_unclip_ratio=1.8,
-    rec_batch_num=6,
-    max_text_length=25,
-    use_space_char=True,
+    rec_batch_num=1,          # CRITICAL: Processes 1 line at a time to save RAM
+    use_mp=False,             # Disable multi-processing to keep memory footprint flat
+    total_process_num=1,
+    enable_mkldnn=False,      # Disabled to prevent extra memory overhead
 )
 
-
-def preprocess_image(image_path: str) -> str:
-    img = Image.open(image_path).convert('RGB')
-
-    # Step 1 — upscale if too small
-    w, h = img.size
-    if w < 1080:
-        scale = 1080 / w
-        img = img.resize(
-            (int(w * scale), int(h * scale)),
-            Image.LANCZOS
-        )
-        logger.info(f'Upscaled from {w}x{h} to {img.size}')
-
-    # Step 2 — boost contrast
-    img = ImageEnhance.Contrast(img).enhance(1.5)
-
-    # Step 3 — boost sharpness
-    img = ImageEnhance.Sharpness(img).enhance(2.0)
-
-    # Save preprocessed image
-    preprocessed_path = image_path + '_processed.png'
-    img.save(preprocessed_path, 'PNG')
-
-    return preprocessed_path
-
-
-def crop_regions(image_path: str) -> list[tuple[str, int]]:
+def process_and_segment_image(input_path: str) -> list[tuple[str, int]]:
     """
-    Crop image into regions and return list of (path, y_offset) tuples.
-    Splitting header from stats table improves accuracy per region.
+    Handles resizing, enhancement, and cropping in a memory-efficient flow.
+    Returns a list of (temp_file_path, y_offset).
     """
-    img = Image.open(image_path).convert('RGB')
-    w, h = img.size
+    segment_paths = []
+    
+    with Image.open(input_path) as img:
+        img = img.convert('RGB')
+        w, h = img.size
+        
+        # 1. Targeted Upscaling
+        if w < 1080:
+            scale = 1080 / w
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            w, h = img.size
+            logger.info(f"Upscaled to {w}x{h}")
 
-    regions = [
-        # (crop_box, y_offset, name)
-        ((0, 0, w, int(h * 0.20)), 0, 'header'),
-        ((0, int(h * 0.20), w, int(h * 0.90)), int(h * 0.20), 'stats'),
-    ]
+        # 2. Enhancement (In-place where possible)
+        img = ImageEnhance.Contrast(img).enhance(1.3)
+        img = ImageEnhance.Sharpness(img).enhance(1.5)
 
-    saved = []
-    for box, y_offset, name in regions:
-        cropped = img.crop(box)
-        path = image_path + f'_region_{name}.png'
-        cropped.save(path)
-        saved.append((path, y_offset))
+        # 3. Dynamic Cropping
+        # We split the image to help PaddleOCR focus and prevent OOM on massive files
+        regions = [
+            ((0, 0, w, int(h * 0.22)), 0, 'header'),       # Top 22%
+            ((0, int(h * 0.20), w, h), int(h * 0.20), 'stats') # Remaining 80% (slight overlap)
+        ]
 
-    return saved
-
+        for box, y_offset, label in regions:
+            with img.crop(box) as chunk:
+                # Use JPEG to reduce disk I/O and intermediate memory pressure
+                chunk_path = f"{input_path}_{label}.jpg"
+                chunk.save(chunk_path, 'JPEG', quality=90)
+                segment_paths.append((chunk_path, y_offset))
+                
+    # Explicitly clear image objects from memory
+    gc.collect()
+    return segment_paths
 
 def run_ocr_on_file(file_path: str) -> list[dict]:
-    result = ocr.ocr(file_path, cls=True)
-    elements = []
+    """Runs inference on a single file chunk."""
+    try:
+        result = ocr.ocr(file_path, cls=True)
+        elements = []
 
-    if result and result[0]:
-        for line in result[0]:
-            box, (text, confidence) = line
+        if result and result[0]:
+            for line in result[0]:
+                box, (text, confidence) = line
+                if confidence < 0.60:
+                    continue
 
-            if confidence < 0.65:
-                logger.info(f'Skipped low confidence: "{text}" ({confidence:.2f})')
-                continue
-
-            text = text.strip()
-            if not text:
-                continue
-
-            x = float(box[0][0])
-            y = float(box[0][1])
-
-            elements.append({
-                'text': text,
-                'x': x,
-                'y': y,
-                'confidence': round(confidence, 3),
-            })
-
-    return elements
-
+                elements.append({
+                    'text': text.strip(),
+                    'x': float(box[0][0]),
+                    'y': float(box[0][1]),
+                    'confidence': round(float(confidence), 3),
+                })
+        return elements
+    except Exception as e:
+        logger.error(f"Inference error on {file_path}: {e}")
+        return []
 
 @app.get('/health')
 def health():
     return {'status': 'ok'}
 
-
 @app.post('/ocr')
 async def recognize(file: UploadFile = File(...)):
-    # Validate file type
     if not file.content_type or not file.content_type.startswith('image/'):
         raise HTTPException(400, 'File must be an image')
 
-    # Determine suffix
-    suffix = '.png' if 'png' in (file.content_type or '') else '.jpg'
-
-    # Save upload to temp file
+    # Use a unique temp file for the original upload
+    suffix = os.path.splitext(file.filename)[1] if file.filename else '.jpg'
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         contents = await file.read()
         tmp.write(contents)
-        tmp_path = tmp.name
+        main_tmp_path = tmp.name
 
-    temp_files = [tmp_path]
-    preprocessed_path = None
+    tracked_files = [main_tmp_path]
+    all_elements = []
 
     try:
-        # Step 1 — preprocess
-        preprocessed_path = preprocess_image(tmp_path)
-        temp_files.append(preprocessed_path)
-
-        # Step 2 — crop into regions
-        regions = crop_regions(preprocessed_path)
-        for region_path, _ in regions:
-            temp_files.append(region_path)
-
-        # Step 3 — OCR each region
-        all_elements = []
-
-        for region_path, y_offset in regions:
-            region_elements = run_ocr_on_file(region_path)
-
-            for el in region_elements:
-                # Adjust Y coordinate back to full image space
-                el['y'] = el['y'] + y_offset
+        # Step 1: Preprocess and generate chunks
+        segments = process_and_segment_image(main_tmp_path)
+        
+        # Step 2: OCR each segment
+        for segment_path, y_offset in segments:
+            tracked_files.append(segment_path)
+            
+            chunk_results = run_ocr_on_file(segment_path)
+            for el in chunk_results:
+                el['y'] += y_offset # Normalize Y coordinate
                 all_elements.append(el)
+            
+            # Clear memory after each segment processing
+            gc.collect()
 
-                logger.info(
-                    f'OCR: "{el["text"]}" '
-                    f'at ({el["x"]:.0f}, {el["y"]:.0f}) '
-                    f'conf:{el["confidence"]}'
-                )
-
-        # Step 4 — sort by Y position top to bottom
+        # Step 3: Global Sorting and Deduplication
         all_elements.sort(key=lambda e: e['y'])
-
-        # Step 5 — deduplicate elements at same position
-        # (can happen at region boundaries)
-        deduplicated = []
-        seen_positions = set()
-
+        
+        final_elements = []
+        seen_keys = set()
         for el in all_elements:
-            key = (round(el['x'], -1), round(el['y'], -1))
-            if key not in seen_positions:
-                seen_positions.add(key)
-                deduplicated.append(el)
+            # Snap to grid to find overlaps (10px tolerance)
+            pos_key = (round(el['x'], -1), round(el['y'], -1))
+            if pos_key not in seen_keys:
+                seen_keys.add(pos_key)
+                final_elements.append(el)
 
         return {
             'success': True,
-            'elements': deduplicated,
-            'count': len(deduplicated),
+            'elements': final_elements,
+            'count': len(final_elements)
         }
 
     except Exception as e:
-        logger.error(f'OCR error: {e}')
-        raise HTTPException(500, f'OCR processing failed: {str(e)}')
+        logger.error(f"Global OCR failure: {e}")
+        raise HTTPException(500, f"Processing failed: {str(e)}")
 
     finally:
-        # Clean up all temp files
-        for path in temp_files:
-            if path and os.path.exists(path):
+        # Cleanup all temporary artifacts
+        for path in tracked_files:
+            if os.path.exists(path):
                 try:
-                    os.unlink(path)
-                except Exception:
+                    os.remove(path)
+                except:
                     pass
-
+        gc.collect()
 
 if __name__ == '__main__':
-    uvicorn.run(
-        app,
-        host='0.0.0.0',
-        port=8000,
-        log_level='info',
-    )
+    # Default to Railway's port 8080
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host='0.0.0.0', port=port)
