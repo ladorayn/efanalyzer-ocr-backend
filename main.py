@@ -27,7 +27,8 @@ reader = easyocr.Reader(
     ['en'],
     gpu=False,
     verbose=False,
-    quantize=True,  # reduces model size and RAM usage
+    quantize=True,
+    model_storage_directory='/tmp/easyocr_models',
 )
 
 logger.info("EasyOCR initialized successfully")
@@ -38,40 +39,44 @@ def preprocess_image(input_path: str) -> str:
         img = img.convert('RGB')
         w, h = img.size
 
-        # Upscale if too small
-        if w < 1080:
-            scale = 1080 / w
+        # Cap maximum size — prevents OOM on large screenshots
+        max_width = 1080
+        if w > max_width:
+            scale = max_width / w
             img = img.resize(
                 (int(w * scale), int(h * scale)),
                 Image.LANCZOS
             )
-            logger.info(f"Upscaled to {img.size}")
+            logger.info(f"Downscaled from {w}x{h} to {img.size}")
+        elif w < 800:
+            scale = 800 / w
+            img = img.resize(
+                (int(w * scale), int(h * scale)),
+                Image.LANCZOS
+            )
+            logger.info(f"Upscaled from {w}x{h} to {img.size}")
 
-        # Mild contrast boost
-        img = ImageEnhance.Contrast(img).enhance(1.3)
+        # Mild contrast only — no sharpness (saves processing)
+        img = ImageEnhance.Contrast(img).enhance(1.2)
 
         preprocessed_path = input_path + '_processed.png'
-        img.save(preprocessed_path, 'PNG')
+        img.save(preprocessed_path, 'PNG', optimize=True)
 
     gc.collect()
     return preprocessed_path
-
-
 def run_ocr(image_path: str) -> list[dict]:
     try:
         # EasyOCR returns list of [bbox, text, confidence]
         results = reader.readtext(
             image_path,
             detail=1,
-            paragraph=False,      # keep each text box separate
-            min_size=10,          # ignore tiny artifacts
-            contrast_ths=0.1,     # better low contrast detection
-            adjust_contrast=0.5,  # auto contrast adjustment
-            text_threshold=0.6,   # minimum text confidence
-            low_text=0.3,         # detect small text
-            link_threshold=0.3,   # how aggressively to link text boxes
-            canvas_size=2560,     # max image dimension
-            mag_ratio=1.5,        # magnification for small text
+            paragraph=False,
+            min_size=10,
+            text_threshold=0.6,
+            low_text=0.3,
+            link_threshold=0.3,
+            canvas_size=1280,   # reduced from 2560 — biggest RAM saver
+            mag_ratio=1.0,      # no magnification — saves RAM
         )
 
         elements = []
