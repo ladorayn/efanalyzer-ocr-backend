@@ -1,7 +1,8 @@
 fastapi==0.111.0
 uvicorn==0.30.0
-paddleocr==2.9.1
-paddlepaddle==3.0.0
+easyocr==1.7.1
 python-multipart==0.0.9
-Pillow==10.3.0
+Pillow==10.4.0
 numpy==1.26.4
+torch==2.2.2
+torchvision==0.17.2
