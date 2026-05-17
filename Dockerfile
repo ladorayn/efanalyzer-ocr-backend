@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Install system dependencies PaddleOCR needs (must be done as root)
+# Install system dependencies for PaddleOCR
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
@@ -10,31 +10,28 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set up a new user named "user" with UID 1000 for Hugging Face Spaces compatibility
-RUN useradd -m -u 1000 user
-
-# Switch to the new user
-USER user
-
-# Set up environment variables
-ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:$PATH
-
 # Set the working directory
-WORKDIR $HOME/app
+WORKDIR /app
 
-# Copy requirements and install dependencies as the 'user'
-COPY --chown=user requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+# Set environment variables
+# PADDLE_HOME ensures models are stored in a predictable location
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PADDLE_HOME=/app/.paddleocr
 
-# Download PaddleOCR models at build time so they're baked into the image under the user's home directory
+# Copy requirements first to leverage Docker cache
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-download PaddleOCR models into the image
 RUN python -c "from paddleocr import PaddleOCR; PaddleOCR(use_angle_cls=True, lang='en', show_log=False)"
 
-# Copy the rest of the application files with correct ownership
-COPY --chown=user . .
+# Copy application code
+COPY . .
 
-# Expose Hugging Face's default port
-EXPOSE 7860
+# Railway defaults to port 8080 if not specified, 
+# but it will inject the PORT variable automatically.
+EXPOSE 8080
 
-# Run the application, defaulting to port 7860
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860}"]
+# Use the dynamic PORT variable provided by Railway
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
